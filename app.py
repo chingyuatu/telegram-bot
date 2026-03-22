@@ -1,8 +1,8 @@
 import os
 import logging
 from flask import Flask, request
-from twilio.twiml.messaging_response import MessagingResponse
 from google import genai
+import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -10,51 +10,81 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN")
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 
 chat_history = {}
 
+@app.route("/webhook", methods=["GET"])
+def verify():
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        logger.info("Webhook verified!")
+        return challenge, 200
+    else:
+        return "Forbidden", 403
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    incoming_msg = request.values.get("Body", "").strip()
-    sender = request.values.get("From", "")
+    data = request.json
+    logger.info("Received: " + str(data))
 
-    logger.info("Received: " + incoming_msg)
+    if data.get("object") == "page":
+        for entry in data.get("entry", []):
+            for event in entry.get("messaging", []):
+                if "message" in event:
+                    sender_id = event["sender"]["id"]
+                    incoming_msg = event["message"].get("text", "")
 
-    if sender not in chat_history:
-        chat_history[sender] = []
+                    if not incoming_msg:
+                        continue
 
-    chat_history[sender].append({
-        "role": "user",
-        "parts": [{"text": incoming_msg}]
-    })
+                    if sender_id not in chat_history:
+                        chat_history[sender_id] = []
 
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=chat_history[sender]
-        )
-        reply_text = response.text
-        logger.info("Reply: " + reply_text)
+                    chat_history[sender_id].append({
+                        "role": "user",
+                        "parts": [{"text": incoming_msg}]
+                    })
 
-        chat_history[sender].append({
-            "role": "model",
-            "parts": [{"text": reply_text}]
-        })
+                    try:
+                        response = client.models.generate_content(
+                            model="gemini-2.0-flash",
+                            contents=chat_history[sender_id]
+                        )
+                        reply_text = response.text
 
-        if len(chat_history[sender]) > 20:
-            chat_history[sender] = chat_history[sender][-20:]
+                        chat_history[sender_id].append({
+                            "role": "model",
+                            "parts": [{"text": reply_text}]
+                        })
 
-    except Exception as e:
-        reply_text = "Error: " + str(e)
-        logger.error("Error: " + str(e))
+                        if len(chat_history[sender_id]) > 20:
+                            chat_history[sender_id] = chat_history[sender_id][-20:]
 
-    resp = MessagingResponse()
-    resp.message(reply_text)
-    return str(resp)
+                    except Exception as e:
+                        reply_text = "Error: " + str(e)
+                        logger.error("Error: " + str(e))
+
+                    send_message(sender_id, reply_text)
+
+    return "OK", 200
+
+def send_message(recipient_id, text):
+    url = f"https://graph.facebook.com/v18.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
+    payload = {
+        "recipient": {"id": recipient_id},
+        "message": {"text": text}
+    }
+    response = requests.post(url, json=payload)
+    logger.info("Sent: " + str(response.json()))
 
 @app.route("/", methods=["GET"])
 def index():
-    return "WhatsApp Bot is running!"
+    return "Messenger Bot is running!"
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
